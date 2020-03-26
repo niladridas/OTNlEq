@@ -1,0 +1,219 @@
+clc;close;clear;
+% rng('default');
+Ns      = 20;      % Sample size
+%
+g        = 9.8; 
+L        = 1.0;
+tinitial = 0;
+tfinal   = 40.0;
+X0       = [L*cos(30*pi/180),L*sin(30*pi/180),0.0,0.0]';
+deltat   = 0.05;
+tspan    = tinitial:deltat:tfinal;
+params.g = g;
+params.L = L;
+dyn_pendulum = @(t,x) pendulumfixedlengthdyn(t,x,params);
+options = odeset('RelTol',1e-12,'AbsTol',1e-10);
+[T,X]    = ode45(dyn_pendulum,tspan,X0,options);
+save('Xreal3','X');
+%%
+Nmeas = size(X,1);
+% Generate measurements
+% Only position measurements
+% Noise S.D. is 0.5 meters in each
+meas_noise_cov = [0.2,0.2].^2;
+% Generate random noise and add to each of the 2 channels
+meas_noise_mu =  [0,0];
+meas_noise    = mvnrnd(meas_noise_mu, diag(meas_noise_cov),Nmeas);
+Y_meas        = X(:,1:2) + meas_noise;
+% Generate initial samples satisfying the constraint.
+theta_0  = 30*pi/180; 
+theta_0width = 30*pi/180;   % +/- 5 degress about theta_0;
+%% MONTE-CARLO RUN
+mcrun = 50;
+cost    = @(X) distance_matrix(X);
+ 
+XA_meanonlyOT    = zeros(Nmeas,4,mcrun);
+XA_covonlyOT     = zeros(Nmeas,4,mcrun); % sig_xx, sig_yy, sig_velxx, sig_velyy
+XA_meanOTNLEQ    = zeros(Nmeas,4,mcrun);
+XA_covOTNLEQ     = zeros(Nmeas,4,mcrun); % sig_xx, sig_yy, sig_velxx, sig_velyy
+XA_meanOTProj    = zeros(Nmeas,4,mcrun);
+XA_covOTProj     = zeros(Nmeas,4,mcrun); % sig_xx, sig_yy, sig_velxx, sig_velyy
+XA_meanOTMA      = zeros(Nmeas,4,mcrun);
+XA_covOTMA       = zeros(Nmeas,4,mcrun); % sig_xx, sig_yy, sig_velxx, sig_velyy
+XA_meanOTNLEQMA  = zeros(Nmeas,4,mcrun);
+XA_covOTNLEQM    = zeros(Nmeas,4,mcrun); % sig_xx, sig_yy, sig_velxx, sig_velyy
+
+for r = 1:mcrun
+   
+
+     msgfilt  = sprintf('MC Run %i',r);
+    disp(msgfilt);
+    disp("================================================");
+
+    
+    
+    theta_0 = theta_0 + theta_0width*2*(rand(1,Ns)-0.5);
+    X0 = [L*cos(theta_0);L*sin(theta_0);zeros(2,Ns)];
+    %%
+    % OT filtering
+    X_prior = X0;
+   
+
+
+    %% Only OT
+    weight  = @(X,Y) mvnpdf(Y-X(1:2,:)',meas_noise_mu,diag(meas_noise_cov));
+    X_meanonlyOT  = zeros(Nmeas,4);
+    X_covonlyOT   = zeros(Nmeas,4); % sig_xx, sig_yy, sig_velxx, sig_velyy
+    tic
+    for i = 1:Nmeas
+        % UPDATE
+        X_post = OT_filter(X_prior,Y_meas(i,:),cost,weight,@OT_constants,@Optimal_Transport);
+%         msgfilt  = sprintf('%i th only OT filtering step of total %i steps',i,Nmeas);
+%         disp(msgfilt);
+        X_meanonlyOT(i,:) = mean(X_post,2)';
+        X_covonlyOT(i,:)  = diag(cov(X_post'))';
+        if i==length(T)
+            break;
+        end
+        tspan    = [T(i),T(i+1)];
+        for j = 1:Ns
+            [~,Xtmp]     =  ode45(dyn_pendulum,tspan,X_post(:,j),options);
+            X_prior(:,j) =  Xtmp(end,:)';
+        end
+    end
+    
+    msgfilt  = sprintf('OT filtering | Total %i steps| Total time %f',Nmeas,toc);
+    disp(msgfilt);
+
+    %% OT with non-linear equality
+    X_prior = X0;
+    weight  = @(X,Y) mvnpdf(Y-X(1:2,:)',meas_noise_mu,diag(meas_noise_cov));
+    X_meanOTNLEQ  = zeros(Nmeas,4);
+    X_covOTNLEQ   = zeros(Nmeas,4); % sig_xx, sig_yy, sig_velxx, sig_velyy
+    tic
+    for i = 1:Nmeas
+        % UPDATE
+        X_post = OT_filtertnonlineq(X_prior,Y_meas(i,:),cost,weight,@OT_constants,@Optimal_Transport,L);
+%         msgfilt  = sprintf('%i th OT filtering non-linear equality step of total %i steps',i,Nmeas);
+%         disp(msgfilt);
+        X_meanOTNLEQ(i,:) = mean(X_post,2)';
+        X_covOTNLEQ(i,:)  = diag(cov(X_post'))';
+        if i==length(T)
+            break;
+        end
+        tspan    = [T(i),T(i+1)];
+        for j = 1:Ns
+            [~,Xtmp]     =  ode45(dyn_pendulum,tspan,X_post(:,j),options);
+            X_prior(:,j) =  Xtmp(end,:)';
+        end
+    end
+    
+    msgfilt  = sprintf('OT filtering non-linear equality | Total %i steps| Total time %f',Nmeas,toc);
+    disp(msgfilt);
+
+    %% OT with only projection and no feedback
+    X_prior = X0;
+    weight  = @(X,Y) mvnpdf(Y-X(1:2,:)',meas_noise_mu,diag(meas_noise_cov));
+    X_meanOTProj  = zeros(Nmeas,4);
+    X_covOTProj   = zeros(Nmeas,4); % sig_xx, sig_yy, sig_velxx, sig_velyy
+    tic
+    for i = 1:Nmeas
+        % UPDATE
+        [X_post,X_postP] =  OT_filtertnonlineqproj(X_prior,Y_meas(i,:),cost,weight,@OT_constants,@Optimal_Transport,L);
+%         msgfilt  = sprintf('%i th only OT filtering projection step of total %i steps',i,Nmeas);
+%         disp(msgfilt);
+        X_meanOTProj(i,:) = mean(X_postP,2)';
+        X_covOTProj(i,:)  = diag(cov(X_postP'))';
+        if i==length(T)
+            break;
+        end
+        tspan    = [T(i),T(i+1)];
+        for j = 1:Ns
+            [~,Xtmp]     =  ode45(dyn_pendulum,tspan,X_post(:,j),options);
+            X_prior(:,j) =  Xtmp(end,:)';
+        end
+    end
+    
+    msgfilt  = sprintf('OT filtering Projection | Total %i steps| Total time %f',Nmeas,toc);
+    disp(msgfilt);
+
+    %% OT with measurement augmentation
+    X_prior = X0;
+    weight  = @(X,Y) weightPM(X,Y,meas_noise_cov,meas_noise_mu,L);
+    X_meanOTMA  = zeros(Nmeas,4);
+    X_covOTMA   = zeros(Nmeas,4); % sig_xx, sig_yy, sig_velxx, sig_velyy
+    tic
+    for i = 1:Nmeas
+        % UPDATE
+        X_post = OT_filter(X_prior,Y_meas(i,:),cost,weight,@OT_constants,@Optimal_Transport);
+%         msgfilt  = sprintf('%i th only OT filtering measurement-augmentation step of total %i steps',i,Nmeas);
+%         disp(msgfilt);
+        X_meanOTMA(i,:) = mean(X_post,2)';
+        X_covOTMA(i,:)  = diag(cov(X_post'))';
+        if i==length(T)
+            break;
+        end
+        tspan    = [T(i),T(i+1)];
+        for j = 1:Ns
+            [~,Xtmp]     =  ode45(dyn_pendulum,tspan,X_post(:,j),options);
+            X_prior(:,j) =  Xtmp(end,:)';
+        end
+    end
+    
+    msgfilt  = sprintf('OT filtering measurement-augmentation | Total %i steps| Total time %f',Nmeas,toc);
+    disp(msgfilt);
+
+    %% OT with non-linear equality and measurement augmentation
+    X_prior = X0;
+    weight  = @(X,Y) weightPM(X,Y,meas_noise_cov,meas_noise_mu,L);
+    X_meanOTNLEQMA  = zeros(Nmeas,4);
+    X_covOTNLEQM   = zeros(Nmeas,4); % sig_xx, sig_yy, sig_velxx, sig_velyy
+    tic
+    for i = 1:Nmeas
+        % UPDATE
+        X_post = OT_filtertnonlineq(X_prior,Y_meas(i,:),cost,weight,@OT_constants,@Optimal_Transport,L);
+        X_meanOTNLEQMA(i,:) = mean(X_post,2)';
+        X_covOTNLEQM(i,:)  = diag(cov(X_post'))';
+        if i==length(T)
+            break;
+        end
+        tspan    = [T(i),T(i+1)];
+        for j = 1:Ns
+            [~,Xtmp]     =  ode45(dyn_pendulum,tspan,X_post(:,j),options);
+            X_prior(:,j) =  Xtmp(end,:)';
+        end
+    end
+    
+    
+    msgfilt  = sprintf('OT filtering All | Total %i steps | Total time %f',Nmeas,toc);
+    disp(msgfilt);
+
+    
+    XA_meanonlyOT(:,:,r)    = X_meanonlyOT;
+    XA_covonlyOT(:,:,r)     = X_covonlyOT;  % sig_xx, sig_yy, sig_velxx, sig_velyy
+    XA_meanOTNLEQ(:,:,r)    = X_meanOTNLEQ; 
+    XA_covOTNLEQ(:,:,r)     = X_covOTNLEQ;  % sig_xx, sig_yy, sig_velxx, sig_velyy
+    XA_meanOTProj(:,:,r)    = X_meanOTProj;
+    XA_covOTProj(:,:,r)     = X_covOTProj;  % sig_xx, sig_yy, sig_velxx, sig_velyy
+    XA_meanOTMA(:,:,r)      = X_meanOTMA;
+    XA_covOTMA(:,:,r)       = X_covOTMA;    % sig_xx, sig_yy, sig_velxx, sig_velyy
+    XA_meanOTNLEQMA(:,:,r)  = X_meanOTNLEQMA;
+    XA_covOTNLEQM(:,:,r)    = X_covOTNLEQM; % sig_xx, sig_yy, sig_velxx, sig_velyy
+
+end
+
+save('Datapendulum3.mat','L','T','XA_meanonlyOT','XA_covonlyOT','XA_meanOTNLEQ','XA_covOTNLEQ',...
+    'XA_meanOTProj','XA_covOTProj','XA_meanOTMA','XA_covOTMA','XA_meanOTNLEQMA','XA_covOTNLEQM');
+
+%%
+function W = weightPM(X_f,Ya,meas_noise_cov,meas_noise_mu,L)
+% X_f = samples
+% Y = observations
+% Augmented Y = Ya
+    yadd  = sum(X_f(1:2,:).*X_f(1:2,:),1);
+    YP = [X_f(1:2,:)',yadd']; % Predicted measurements
+    Ya = [Ya,L^2*ones(size(Ya,1),1)];
+    meas_noise_mu =  [meas_noise_mu,0];
+    meas_noise_cov = diag([meas_noise_cov,0.01]);
+    W =  mvnpdf(Ya-YP,meas_noise_mu,meas_noise_cov);
+end
